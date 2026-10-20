@@ -1,0 +1,120 @@
+name: IRX4 JXC43 diagnostic sticks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Scarica sorgenti ufficiali MULTI 1.3.4.63
+        uses: actions/checkout@v4
+        with:
+          repository: pascallanger/DIY-Multiprotocol-TX-Module
+          ref: v1.3.4.63
+          persist-credentials: false
+
+      - name: Installa Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '0.32.2'
+
+      - name: Installa core STM32 ufficiale
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli config init --additional-urls https://raw.githubusercontent.com/pascallanger/DIY-Multiprotocol-TX-Module-Boards/master/package_multi_4in1_board_index.json
+          arduino-cli core update-index
+          arduino-cli core install multi4in1:STM32F1@1.3.1
+          mkdir -p build output
+          git rev-parse HEAD > output/source-commit.txt
+
+      - name: Integra JXC43 e verifica encoder C++
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          files = json.loads(r"""{"JXC43_checksum.h":"// JXC43 application checksum for a 9-byte payload. Not the XN297 RF CRC.\n#ifndef JXC43_CHECKSUM_H\n#define JXC43_CHECKSUM_H\n#include <stdint.h>\n\nstatic inline uint8_t JXC43_checksum(const uint8_t *p)\n{\n    uint8_t sum = 0;\n    for (uint8_t i = 0; i < 8; ++i)\n        sum += p[i];\n    return sum ^ p[0] ^ p[1] ^ p[2];\n}\n#endif\n","JXC43_packet.h":"// SPDX-License-Identifier: GPL-3.0-or-later\n#ifndef JXC43_PACKET_H\n#define JXC43_PACKET_H\n#include \"JXC43_checksum.h\"\n\nstatic inline uint16_t JXC43_limit(uint16_t value)\n{\n    return value > 1000 ? 1000 : value;\n}\n\nstatic inline void JXC43_encode(uint8_t *p, uint16_t steering,\n                               uint16_t throttle, uint8_t gyro, uint8_t counter)\n{\n    steering = JXC43_limit(steering);\n    throttle = JXC43_limit(throttle);\n    p[0] = throttle & 255;\n    p[1] = steering & 255;\n    p[2] = ((throttle >> 2) & 0xC0) | ((steering >> 4) & 0x30) | (counter & 7);\n    p[3] = 0xBB; // Captured reference; subtrim interpretation pending.\n    p[4] = 0x64;\n    p[5] = 100 - (gyro > 100 ? 100 : gyro);\n    p[6] = 0x64;\n    p[7] = 0x81; // Captured HIGH speed, lights off. Other flags pending.\n    p[8] = JXC43_checksum(p);\n}\n#endif\n","JXC43_nrf24l01.ino":"// SPDX-License-Identifier: GPL-3.0-or-later\n// Experimental JXC 1:43 protocol: receiver-advertised address, fixed data CH18.\n#if defined(JXC43_NRF24L01_INO) && defined(NRF24L01_INSTALLED)\n#include \"iface_xn297.h\"\n#include \"JXC43_packet.h\"\n\nstatic const uint8_t jxc43_advert_addr[5] = {0x4C,0x58,0x48,0x50,0x43};\nstatic uint8_t jxc43_addr[5], jxc43_seen, jxc43_counter;\nstatic bool jxc43_ready, jxc43_armed, jxc43_center_seen;\nstatic uint32_t jxc43_center_since, jxc43_last_callback;\n\nstatic uint16_t JXC43_callback()\n{\n    uint32_t now = millis();\n    if((uint32_t)(now - jxc43_last_callback) > 100)\n    {\n        jxc43_armed = false;\n        jxc43_center_seen = false;\n    }\n    jxc43_last_callback = now;\n    if(!jxc43_ready)\n    {\n        if(XN297_IsRX())\n        {\n            uint8_t advert[9];\n            if(XN297_ReadPayload(advert,9) && advert[0] == 0x4B && advert[1] == 0x4E &&\n               advert[2] == 0xBB && JXC43_checksum(advert) == advert[8])\n            {\n                if(!jxc43_seen || memcmp(jxc43_addr,&advert[3],5) != 0)\n                {\n                    memcpy(jxc43_addr,&advert[3],5);\n                    jxc43_seen = 1;\n                }\n                else ++jxc43_seen;\n                if(jxc43_seen >= 3)\n                {\n                    XN297_SetTxRxMode(TXRX_OFF);\n                    XN297_SetTXAddr(jxc43_addr,5);\n                    XN297_RFChannel(18);\n                    jxc43_ready = true;\n                    BIND_DONE; // Address learned; not an RF acknowledgement.\n                    debugln(\"JXC43 ID=%02X%02X%02X%02X%02X CH18\",\n                        jxc43_addr[0],jxc43_addr[1],jxc43_addr[2],jxc43_addr[3],jxc43_addr[4]);\n                    return 1000;\n                }\n            }\n            XN297_SetTxRxMode(TXRX_OFF);\n            XN297_SetTxRxMode(RX_EN);\n        }\n        return 500;\n    }\n    uint16_t throttle = convert_channel_16b_limit(CH2,0,1000);\n    if(!jxc43_armed)\n    {\n        if(throttle >= 480 && throttle <= 520)\n        {\n            if(!jxc43_center_seen)\n            {\n                jxc43_center_since = now;\n                jxc43_center_seen = true;\n            }\n            if((uint32_t)(now - jxc43_center_since) >= 500)\n            {\n                jxc43_armed = true;\n                debugln(\"JXC43: inputs enabled\");\n            }\n        }\n        else jxc43_center_seen = false;\n    }\n    uint8_t payload[9];\n    JXC43_encode(payload,\n        jxc43_armed ? convert_channel_16b_limit(CH1,0,1000) : 500,\n        jxc43_armed ? throttle : 500,\n        convert_channel_16b_limit(CH3,0,100), jxc43_counter++);\n    XN297_SetPower();\n    XN297_SetTxRxMode(TXRX_OFF);\n    XN297_SetTxRxMode(TX_EN);\n    XN297_WritePayload(payload,9);\n    return 3970;\n}\n\nvoid JXC43_init()\n{\n    BIND_IN_PROGRESS;\n    jxc43_seen = jxc43_counter = 0;\n    jxc43_ready = jxc43_armed = jxc43_center_seen = false;\n    jxc43_last_callback = millis();\n    XN297_Configure(XN297_CRCEN,XN297_SCRAMBLED,XN297_1M);\n    XN297_SetTXAddr(jxc43_advert_addr,5);\n    XN297_SetRXAddr(jxc43_advert_addr,9);\n    XN297_RFChannel(67);\n    XN297_SetTxRxMode(RX_EN);\n    debugln(\"JXC43: waiting CH67; center CH2\");\n}\n#endif\n","install.py":"\"\"\"Add experimental JXC43 to a clean MULTI checkout, keeping its config.\"\"\"\nfrom pathlib import Path\nimport re\n\nroot = Path('Multiprotocol')\np = root / 'Multiprotocol.h'\ntext = p.read_text()\nassert not re.search(r'PROTO_\\w+\\s*=\\s*110\\s*[,}]', text), 'ID 110 occupied'\nanchor = 'enum PROTOCOLS\\n{'\nassert anchor in text\ntext = text.replace(anchor, anchor + '\\n\\tPROTO_JXC43 = 110, // Local experimental ID, not allocated upstream', 1)\np.write_text(text)\n\np = root / 'Multi_Protos.ino'\ntext = p.read_text()\nanchor = 'const mm_protocol_definition multi_protocols[] = {'\nassert anchor in text\ntext = 'const char STR_JXC43[] = \"JXC43\";\\n' + text\nentry = '''\n    #if defined(JXC43_NRF24L01_INO) && defined(NRF24L01_INSTALLED)\n        {PROTO_JXC43, STR_JXC43, NO_SUBTYPE, 0, OPTION_NONE, 0, 0, SW_NRF, JXC43_init, JXC43_callback},\n    #endif\n'''\ntext = text.replace(anchor, anchor + entry, 1)\np.write_text(text)\n\np = root / '_Config.h'\ntext = p.read_text()\nassert re.search(r'^\\s*#define\\s+NRF24L01_INSTALLED\\b',text,re.M)\ntext = re.sub(r'(?m)^(\\s*#define\\s+\\w+_(?:A7105|CC2500|CYRF6936|NRF24L01|CCNRF|SX1276)_INO\\b[^\\n]*)', r'//\\1', text)\ntext += '\\n#define JXC43_NRF24L01_INO\\n'\np.write_text(text)\nPath('output/config.h').write_text(text)\nprint('Installed diagnostic JXC43 ID110; other RF protocols disabled for bench build')\n","test-packet.cpp":"#include \"JXC43_packet.h\"\n#include <cassert>\n#include <fstream>\n#include <sstream>\n#include <string>\n\nint main(int argc, char **argv)\n{\n    assert(argc == 2);\n    std::ifstream input(argv[1]);\n    assert(input.good());\n    std::string line;\n    unsigned count = 0;\n    while(std::getline(input,line))\n    {\n        if(line.empty()) continue;\n        std::istringstream row(line);\n        unsigned value;\n        uint8_t p[9];\n        for(unsigned i=0;i<9;++i) { assert(bool(row >> std::hex >> value)); p[i]=value; }\n        assert(JXC43_checksum(p) == p[8]);\n        ++count;\n    }\n    assert(count >= 50);\n    for(int steering : {0, 487, 500, 1000})\n    for(int throttle : {0, 500, 1000})\n    for(int gyro : {0, 49, 100})\n    for(int counter=0;counter<8;++counter)\n    {\n        uint8_t p[9];\n        JXC43_encode(p,steering,throttle,gyro,counter);\n        assert((p[0] | ((p[2]&0xC0)<<2)) == throttle);\n        assert((p[1] | ((p[2]&0x30)<<4)) == steering);\n        assert((p[2]&7) == counter);\n        assert(100-p[5] == gyro);\n        assert(JXC43_checksum(p) == p[8]);\n    }\n    uint8_t p[9];\n    JXC43_encode(p,2000,2000,255,255);\n    assert((p[0] | ((p[2]&0xC0)<<2)) == 1000);\n    assert((p[1] | ((p[2]&0x30)<<4)) == 1000);\n    assert(p[5] == 0 && (p[2]&7) == 7);\n}\n","vectors.txt":"4B 4E BB 76 9A 00 12 32 16\nF4 F4 50 BB 64 64 64 81 F0\nF4 F4 55 BB 64 64 64 81 F0\nF4 F4 56 BB 64 64 64 81 F0\nF4 F4 57 BB 64 64 64 81 F0\nF4 F4 52 BA 64 64 64 81 F3\nF4 F4 54 BB 64 64 64 81 F0\nF4 F4 51 BB 64 64 64 81 F0\nF4 F4 53 BB 64 64 64 81 F0\nF4 F4 52 BB 64 64 64 81 F0\nF4 F4 50 BA 64 64 64 81 CF\nF4 F4 51 BA 64 64 64 81 F1\nF4 F4 53 BA 64 64 64 81 F1\nF4 F4 55 BA 64 64 64 81 F1\nF4 F4 56 BA 64 64 64 81 F3\nF4 F4 57 BA 64 64 64 81 F1\nF4 F4 50 BC 64 64 64 81 F1\nF4 F4 51 BC 64 64 64 81 F3\nF4 E7 50 BB 64 64 64 81 D0\nF4 E7 51 BB 64 64 64 81 D6\nF4 EB 52 BB 64 64 64 81 D4\nF4 EB 53 BB 64 64 64 81 D6\nF4 ED 54 BB 64 64 64 81 D0\nF4 ED 55 BB 64 64 64 81 D2\nF4 F4 50 DF 64 3F 64 80 CE\nF4 F4 51 DF 64 3F 64 80 CE\nF4 F4 57 DE 64 3F 64 80 F3\nF4 00 45 DF 64 40 64 80 11\nF4 00 40 DF 64 40 64 80 2F\nF4 E8 72 DF 64 40 64 80 DB\nF4 E8 71 DF 64 40 64 80 D9\nF4 A5 70 DF 64 3F 64 80 4E\nF4 B4 72 DF 64 3F 64 80 B2\nE8 F4 D4 BC 64 64 64 81 D1\nE8 F4 D0 BC 64 64 64 81 D9\nE8 F4 D4 BB 64 64 64 81 D0\n00 F4 11 BC 64 64 64 81 8B\n00 F4 13 BC 64 64 64 81 97\nF4 F4 50 BC 64 64 64 01 71\nF4 F4 52 BB 64 64 64 01 70\nF4 F4 53 BC 64 64 64 81 F7\nF4 F4 56 BB 64 64 64 89 F8\nF4 F4 50 BB 64 64 64 89 F8\nF4 F4 50 BA 64 64 64 85 F3\nF4 F4 56 BA 64 64 64 85 FF\nF4 F4 51 BB 64 00 64 81 6C\nF4 F4 54 BB 64 00 64 81 14\nF4 F4 50 BB 64 33 64 81 3F\nF4 F4 51 BB 64 33 64 81 21\n4B 4E BB 13 BD 00 12 32 D6\n"}""")
+          Path('jxc43').mkdir(exist_ok=True)
+          for name, content in files.items():
+              Path('jxc43', name).write_text(content)
+              Path('output', name).write_text(content)
+              if name.endswith('.h') or name.endswith('.ino'):
+                  Path('Multiprotocol', name).write_text(content)
+          PY
+          g++ -std=c++11 -Wall -Wextra -Werror jxc43/test-packet.cpp -o /tmp/test-jxc43
+          /tmp/test-jxc43 jxc43/vectors.txt
+          python3 jxc43/install.py
+          cp Multiprotocol/Multi_Protos.ino output/
+          cp Multiprotocol/Multiprotocol.h output/
+
+      - name: Compila MULTI completo con LTO a 0x08002000
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli compile \
+            --fqbn 'multi4in1:STM32F1:multistm32f103cb:debug_option=none,usb_support=disabled' \
+            --build-property 'build.upload_flags=-DGENERIC_BOOTLOADER -DARDUINO_MULTI_DEBUG' \
+            --build-property 'build.flags.optimize=-Os -flto' \
+            --build-property 'compiler.ar.cmd=arm-none-eabi-gcc-ar' \
+            --build-path "$GITHUB_WORKSPACE/build" \
+            "$GITHUB_WORKSPACE/Multiprotocol" 2>&1 | tee output/build.log
+
+      - name: Verifica vettori, firma e funzioni incluse
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, re, struct
+          raw = Path('build/Multiprotocol.ino.bin').read_bytes()
+          sp, reset = struct.unpack_from('<II', raw)
+          assert 0x20000000 < sp <= 0x20005000, hex(sp)
+          assert reset & 1, 'Reset handler non Thumb'
+          assert 0x08002000 <= (reset & ~1) < 0x08002000 + len(raw), hex(reset)
+          assert len(raw) <= 120808, 'Firmware troppo grande'
+          sig = re.search(rb'multi-x([0-9a-fA-F]{8})-([0-9]{8})$', raw)
+          assert sig, 'Firma MULTI ufficiale assente'
+          flags = int(sig[1], 16)
+          assert flags & 3 == 1, 'MCU non STM32'
+          assert flags & 0x80, 'Supporto bootloader assente'
+          assert flags & 0x100, 'CHECK_FOR_BOOTLOADER assente'
+          assert flags & 0x1000, 'Diagnostic UART missing'
+          preproc = Path('build/preproc/ctags_target_for_gcc_minus_e.cpp').read_text()
+          assert 'JXC43_init' in preproc and 'JXC43_callback' in preproc
+          assert 'PROTO_JXC43' in preproc and 'JXC43' in preproc
+          name = 'jxc43dbg.bin'
+          Path('output', name).write_bytes(raw)
+          digest = hashlib.sha256(raw).hexdigest()
+          Path('output/SHA256SUMS.txt').write_text(digest + '  ' + name + '\n')
+          report = f'Source: MULTI v1.3.4.63 + JXC43 ID110\nBytes: {len(raw)}\nStack: {sp:#010x}\nReset: {reset:#010x}\nSignature: {sig[0].decode()}\nUART: 115200 8N1; JXC43 diagnostics; CH1 steering CH2 throttle CH3 gyro\nFlash origin: 0x08002000\nHardware test: pending\n'
+          Path('output/validation.txt').write_text(report)
+          print(report)
+          PY
+
+      - name: Conserva ELF e mappa
+        shell: bash
+        run: |
+          cp build/Multiprotocol.ino.elf output/
+          cp build/Multiprotocol.ino.map output/
+
+      - name: Scarica firmware e rapporto
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-JXC43-DEBUG
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Conserva log in caso di errore
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-JXC43-diagnostica
+          path: output/
+          if-no-files-found: ignore
