@@ -48,6 +48,15 @@ jobs:
               assert re.search(r'^\s*#define\s+' + flag + r'\b', text, re.M), flag
           p.write_text(text)
           Path('output/config.h').write_text(text)
+          # Verify the actual UART type during compilation.
+          sketch = Path('Multiprotocol/Multiprotocol.ino')
+          sketch.write_text(sketch.read_text() + '''
+          #include <HardwareSerial.h>
+          #if defined(SERIAL_USB) || !defined(ARDUINO_MULTI_DEBUG)
+          #error IRX4 requires hardware UART debug with USB serial disabled
+          #endif
+          static HardwareSerial& irx4_uart_type_check = Serial;
+          ''')
           PY
 
       - name: Compila a 0x08002000 con debug USART1
@@ -83,8 +92,8 @@ jobs:
           preproc = Path('build/preproc/ctags_target_for_gcc_minus_e.cpp').read_text()
           assert 'XN297Dump_init' in preproc
           assert 'XN297Dump_callback' in preproc
-          assert re.search(r'extern\s+HardwareSerial\s+Serial\s*;', preproc), 'Serial hardware assente'
-          assert not re.search(r'extern\s+USBSerial\s+Serial\s*;', preproc), 'USB serial attiva'
+          assert 'irx4_uart_type_check = Serial' in preproc, 'Verifica del tipo UART assente'
+          assert re.search(r'Serial\s*\.\s*begin\s*\(\s*115200\s*,', preproc), 'Inizializzazione UART assente'
           name = 'irx4dump.bin'
           Path('output', name).write_bytes(raw)
           digest = hashlib.sha256(raw).hexdigest()
