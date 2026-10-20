@@ -53,13 +53,15 @@ jobs:
           cp Multiprotocol/Multi_Protos.ino output/
           cp Multiprotocol/Multiprotocol.h output/
 
-      - name: Compila a 0x08002000 con debug USART1
+      - name: Compila MULTI completo con LTO a 0x08002000
         shell: bash
         run: |
           set -euo pipefail
           arduino-cli compile \
             --fqbn 'multi4in1:STM32F1:multistm32f103cb:debug_option=none,usb_support=disabled' \
             --build-property 'build.upload_flags=-DGENERIC_BOOTLOADER' \
+            --build-property 'build.flags.optimize=-Os -flto' \
+            --build-property 'compiler.ar.cmd=arm-none-eabi-gcc-ar' \
             --build-path "$GITHUB_WORKSPACE/build" \
             "$GITHUB_WORKSPACE/Multiprotocol" 2>&1 | tee output/build.log
 
