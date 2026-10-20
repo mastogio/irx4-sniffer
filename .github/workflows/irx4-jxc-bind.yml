@@ -66,7 +66,7 @@ jobs:
                           {
                               if(jxc_seen && memcmp(jxc_target, &advert[3], 5) != 0)
                               {
-                                  debugln("JXC: two cars detected; stopped, power off other car");
+                                  debugln("JXC: multiple cars; STOP");
                                   jxc_state = 3;
                                   XN297_SetTxRxMode(TXRX_OFF);
                                   return 1000;
@@ -74,7 +74,7 @@ jobs:
                               memcpy(jxc_target, &advert[3], 5);
                               if(++jxc_seen >= 3)
                               {
-                                  debugln("JXC: target %02X %02X %02X %02X %02X; NEUTRAL probe CH=%u",
+                                  debugln("JXC: ID=%02X%02X%02X%02X%02X neutral CH=%u",
                                       jxc_target[0],jxc_target[1],jxc_target[2],jxc_target[3],jxc_target[4],jxc_probe_channel);
                                   XN297_SetTxRxMode(TXRX_OFF);
                                   XN297_SetTXAddr(jxc_target, 5);
@@ -98,7 +98,7 @@ jobs:
                       jxc_listen();
                       jxc_start = millis();
                       jxc_state = 2;
-                      debugln("JXC: probe finished; listening for returning announcements");
+                      debugln("JXC: TX done; listening");
                       return 500;
                   }
                   // Exact captured neutral frames, counters 0..7. For p[3]=BB each
@@ -119,7 +119,7 @@ jobs:
                       if(XN297_ReadPayload(advert,9) && advert[0] == 0x4B && advert[1] == 0x4E &&
                          memcmp(&advert[3],jxc_target,5) == 0)
                       {
-                          debugln("JXC: announcement returned after %lu ms; NOT proof of binding",
+                          debugln("JXC: announce back after %lu ms",
                               (unsigned long)(millis() - jxc_start));
                           jxc_state = 3;
                       }
@@ -128,7 +128,7 @@ jobs:
                   }
                   if((uint32_t)(millis() - jxc_start) >= 3000)
                   {
-                      debugln("JXC: observation ended; no automatic success verdict; restart to retry");
+                      debugln("JXC: test ended; check car LED");
                       XN297_SetTxRxMode(TXRX_OFF);
                       jxc_state = 3;
                   }
@@ -145,13 +145,13 @@ jobs:
               if(sub_protocol != 1 ||
                  !(option == 67 || option == 18 || option == 47 || option == 50 || option == 15))
               {
-                  debugln("JXC TEST: disabled. Select subtype 1Mbps and Option 67/18/47/50/15; restart.");
+                  debugln("JXC: disabled; use 1Mbps CH67/18/47/50/15");
                   return;
               }
               XN297_Configure(XN297_CRCEN, XN297_SCRAMBLED, XN297_1M);
               jxc_listen();
               jxc_state = 0;
-              debugln("JXC TEST: waiting on CH67 for 3 known announcements; probe channel=%u",jxc_probe_channel);
+              debugln("JXC: waiting CH67, 3 adverts; test CH=%u",jxc_probe_channel);
           }
           #endif
           
@@ -235,7 +235,7 @@ jobs:
           preproc = Path('build/preproc/ctags_target_for_gcc_minus_e.cpp').read_text()
           assert 'XN297Dump_init' in preproc
           assert 'XN297Dump_callback' in preproc
-          assert 'JXC TEST: waiting on CH67' in preproc
+          assert 'JXC: waiting CH67' in preproc
           assert 'jxc_frames >= 500' in preproc
           assert 'irx4_uart_type_check = Serial' in preproc, 'Verifica del tipo UART assente'
           assert re.search(r'Serial\s*\.\s*begin\s*\(\s*115200\s*,', preproc), 'Inizializzazione UART assente'
