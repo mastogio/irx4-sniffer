@@ -1,0 +1,117 @@
+name: IRX4 XN297Dump UART via radio
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Scarica sorgenti ufficiali MULTI 1.3.4.63
+        uses: actions/checkout@v4
+        with:
+          repository: pascallanger/DIY-Multiprotocol-TX-Module
+          ref: v1.3.4.63
+          persist-credentials: false
+
+      - name: Installa Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '0.32.2'
+
+      - name: Installa core STM32 ufficiale
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli config init --additional-urls https://raw.githubusercontent.com/pascallanger/DIY-Multiprotocol-TX-Module-Boards/master/package_multi_4in1_board_index.json
+          arduino-cli core update-index
+          arduino-cli core install multi4in1:STM32F1@1.3.1
+          mkdir -p build output
+          git rev-parse HEAD > output/source-commit.txt
+
+      - name: Configura solo XN297Dump con UART e bootloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('Multiprotocol/_Config.h')
+          text = p.read_text()
+          text = re.sub(r'(?m)^(\s*#define\s+\w+_(?:A7105|CC2500|CYRF6936|NRF24L01|CCNRF|SX1276)_INO\b[^\n]*)', r'//\1', text)
+          text += '\n#define XN297DUMP_NRF24L01_INO\n'
+          for flag in ['CHECK_FOR_BOOTLOADER', 'ENABLE_SERIAL', 'A7105_INSTALLED', 'CC2500_INSTALLED', 'CYRF6936_INSTALLED', 'NRF24L01_INSTALLED']:
+              assert re.search(r'^\s*#define\s+' + flag + r'\b', text, re.M), flag
+          p.write_text(text)
+          Path('output/config.h').write_text(text)
+          PY
+
+      - name: Compila a 0x08002000 con debug USART1
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli compile \
+            --fqbn 'multi4in1:STM32F1:multistm32f103cb:debug_option=none,usb_support=disabled' \
+            --build-property 'build.upload_flags=-DGENERIC_BOOTLOADER -DARDUINO_MULTI_DEBUG' \
+            --build-path "$GITHUB_WORKSPACE/build" \
+            "$GITHUB_WORKSPACE/Multiprotocol" 2>&1 | tee output/build.log
+
+      - name: Verifica vettori, firma e funzioni incluse
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, re, struct
+          raw = Path('build/Multiprotocol.ino.bin').read_bytes()
+          sp, reset = struct.unpack_from('<II', raw)
+          assert 0x20000000 < sp <= 0x20005000, hex(sp)
+          assert reset & 1, 'Reset handler non Thumb'
+          assert 0x08002000 <= (reset & ~1) < 0x08002000 + len(raw), hex(reset)
+          assert len(raw) <= 120808, 'Firmware troppo grande'
+          sig = re.search(rb'multi-x([0-9a-fA-F]{8})-([0-9]{8})$', raw)
+          assert sig, 'Firma MULTI ufficiale assente'
+          flags = int(sig[1], 16)
+          assert flags & 3 == 1, 'MCU non STM32'
+          assert flags & 0x80, 'Supporto bootloader assente'
+          assert flags & 0x100, 'CHECK_FOR_BOOTLOADER assente'
+          assert flags & 0x1000, 'Debug seriale assente'
+          preproc = Path('build/preproc/ctags_target_for_gcc_minus_e.cpp').read_text()
+          assert 'XN297Dump_init' in preproc
+          assert 'XN297Dump_callback' in preproc
+          assert re.search(r'extern\s+HardwareSerial\s+Serial\s*;', preproc), 'Serial hardware assente'
+          assert not re.search(r'extern\s+USBSerial\s+Serial\s*;', preproc), 'USB serial attiva'
+          name = 'irx4dump.bin'
+          Path('output', name).write_bytes(raw)
+          digest = hashlib.sha256(raw).hexdigest()
+          Path('output/SHA256SUMS.txt').write_text(digest + '  ' + name + '\n')
+          report = f'Source: MULTI v1.3.4.63\nBytes: {len(raw)}\nStack: {sp:#010x}\nReset: {reset:#010x}\nSignature: {sig[0].decode()}\nUART: USART1, 115200 baud, 8N1\nFlash origin: 0x08002000\nHardware test: pending\n'
+          Path('output/validation.txt').write_text(report)
+          print(report)
+          PY
+
+      - name: Conserva ELF e mappa
+        shell: bash
+        run: |
+          cp build/Multiprotocol.ino.elf output/
+          cp build/Multiprotocol.ino.map output/
+
+      - name: Scarica firmware e rapporto
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-XN297Dump-UART-radio
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Conserva log in caso di errore
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-diagnostica
+          path: output/
+          if-no-files-found: ignore
