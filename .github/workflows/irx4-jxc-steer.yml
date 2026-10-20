@@ -1,0 +1,279 @@
+name: IRX4 JXC small steering test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Scarica sorgenti ufficiali MULTI 1.3.4.63
+        uses: actions/checkout@v4
+        with:
+          repository: pascallanger/DIY-Multiprotocol-TX-Module
+          ref: v1.3.4.63
+          persist-credentials: false
+
+      - name: Incorpora prova JXC separata dallo sniffer
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          source = r"""
+          /* Experimental JXC binding probe; replaces XN297Dump only in a separate build.
+           * GPL-3.0-or-later, as the MULTI project into which this file is compiled.
+           * Captured neutral / small steering replay; throttle always neutral.
+           */
+          #ifdef XN297DUMP_NRF24L01_INO
+          #include "iface_xn297.h"
+          
+          static const uint8_t jxc_announce_address[5] = {0x4C,0x58,0x48,0x50,0x43};
+          static uint8_t jxc_target[5];
+          static uint8_t jxc_seen;
+          static uint8_t jxc_probe_channel;
+          static uint16_t jxc_frames;
+          static uint32_t jxc_start;
+          static uint8_t jxc_state;
+          
+          static void jxc_listen()
+          {
+              XN297_SetTxRxMode(TXRX_OFF);
+              XN297_SetTXAddr(jxc_announce_address, 5);
+              XN297_SetRXAddr(jxc_announce_address, 9);
+              XN297_RFChannel(67);
+              XN297_SetTxRxMode(RX_EN);
+          }
+          
+          static uint16_t XN297Dump_callback()
+          {
+              if(jxc_state == 0)
+              {
+                  if(XN297_IsRX())
+                  {
+                      uint8_t advert[9];
+                      bool valid = XN297_ReadPayload(advert, 9);
+                      if(valid && advert[0] == 0x4B && advert[1] == 0x4E && advert[2] == 0xBB)
+                      {
+                          // Restrict this initial probe to the two captured car addresses.
+                          bool known = advert[5] == 0 && advert[6] == 0x12 && advert[7] == 0x32 &&
+                              ((advert[3] == 0x76 && advert[4] == 0x9A && advert[8] == 0x16) ||
+                               (advert[3] == 0x13 && advert[4] == 0xBD && advert[8] == 0xD6));
+                          if(known)
+                          {
+                              if(jxc_seen && memcmp(jxc_target, &advert[3], 5) != 0)
+                              {
+                                  debugln("JXC: multiple cars; STOP");
+                                  jxc_state = 3;
+                                  XN297_SetTxRxMode(TXRX_OFF);
+                                  return 1000;
+                              }
+                              memcpy(jxc_target, &advert[3], 5);
+                              if(++jxc_seen >= 3)
+                              {
+                                  debugln("JXC: ID=%02X%02X%02X%02X%02X neutral CH=%u",
+                                      jxc_target[0],jxc_target[1],jxc_target[2],jxc_target[3],jxc_target[4],jxc_probe_channel);
+                                  XN297_SetTxRxMode(TXRX_OFF);
+                                  XN297_SetTXAddr(jxc_target, 5);
+                                  XN297_RFChannel(jxc_probe_channel);
+                                  jxc_frames = 0;
+                                  jxc_start = millis();
+                                  jxc_state = 1;
+                                  return 1000;
+                              }
+                          }
+                      }
+                      XN297_SetTxRxMode(TXRX_OFF);
+                      XN297_SetTxRxMode(RX_EN);
+                  }
+                  return 500;
+              }
+              if(jxc_state == 1)
+              {
+                  uint32_t elapsed = millis() - jxc_start;
+                  uint8_t stage = elapsed < 3000 ? 0 : (elapsed < 4000 ? 1 : 2);
+                  static uint8_t previous_stage = 255;
+                  if(stage != previous_stage)
+                  {
+                      if(stage == 0) debugln("JXC: neutral 500; throttle 500");
+                      if(stage == 1) debugln("JXC: steering 487; throttle 500");
+                      if(stage == 2) debugln("JXC: HOLD neutral; throttle 500");
+                      previous_stage = stage;
+                  }
+                  // Replay complete captured frames, without calculating an unknown checksum.
+                  uint8_t neutral[9] = {0xF4,0xF4,0x50,0xBB,0x64,0x64,0x64,0x81,0xF0};
+                  const uint8_t steering[2][9] = {
+                      {0xF4,0xE7,0x50,0xBB,0x64,0x64,0x64,0x81,0xD0},
+                      {0xF4,0xE7,0x51,0xBB,0x64,0x64,0x64,0x81,0xD6}
+                  };
+                  neutral[2] |= (jxc_frames & 7);
+                  XN297_SetTxRxMode(TXRX_OFF);
+                  XN297_SetTxRxMode(TX_EN);
+                  if(stage == 1)
+                      XN297_WritePayload((uint8_t*)steering[jxc_frames & 1], 9);
+                  else
+                      XN297_WritePayload(neutral, 9);
+                  ++jxc_frames;
+                  return 3970;
+              }
+              if(jxc_state == 2)
+              {
+                  if(XN297_IsRX())
+                  {
+                      uint8_t advert[9];
+                      if(XN297_ReadPayload(advert,9) && advert[0] == 0x4B && advert[1] == 0x4E &&
+                         memcmp(&advert[3],jxc_target,5) == 0)
+                      {
+                          debugln("JXC: announce back after %lu ms",
+                              (unsigned long)(millis() - jxc_start));
+                          jxc_state = 3;
+                      }
+                      XN297_SetTxRxMode(TXRX_OFF);
+                      if(jxc_state == 2) XN297_SetTxRxMode(RX_EN);
+                  }
+                  if((uint32_t)(millis() - jxc_start) >= 3000)
+                  {
+                      debugln("JXC: test ended; check car LED");
+                      XN297_SetTxRxMode(TXRX_OFF);
+                      jxc_state = 3;
+                  }
+              }
+              return 1000;
+          }
+          
+          void XN297Dump_init(void)
+          {
+              BIND_DONE; // MULTI UI state only: never claim that the JXC car bound.
+              jxc_seen = 0;
+              jxc_state = 3;
+              jxc_probe_channel = option;
+              if(sub_protocol != 1 ||
+                 option != 18)
+              {
+                  debugln("JXC: disabled; use 1Mbps Option 18");
+                  return;
+              }
+              XN297_Configure(XN297_CRCEN, XN297_SCRAMBLED, XN297_1M);
+              jxc_listen();
+              jxc_state = 0;
+              debugln("JXC STEER: wait CH67; test CH=%u",jxc_probe_channel);
+          }
+          #endif
+          
+          """.lstrip("\n").encode()
+          Path('Multiprotocol/XN297Dump_nrf24l01.ino').write_bytes(source)
+          Path('output').mkdir(exist_ok=True)
+          Path('output/JXC-steering-test.ino').write_bytes(source)
+          Path('output/TEST-NOTES.txt').write_text('STEERING TEST: Original TX OFF, one car, wheels raised. XN297DP 1Mbps Option 18 then restart. Learns advertised ID on CH67. Neutral 3s, steering 487 for 1s (small offset), then continuous neutral. Throttle always 500; no stick control. Switch off module to stop. Hardware test pending.\n')
+          PY
+      - name: Installa Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '0.32.2'
+
+      - name: Installa core STM32 ufficiale
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli config init --additional-urls https://raw.githubusercontent.com/pascallanger/DIY-Multiprotocol-TX-Module-Boards/master/package_multi_4in1_board_index.json
+          arduino-cli core update-index
+          arduino-cli core install multi4in1:STM32F1@1.3.1
+          mkdir -p build output
+          git rev-parse HEAD > output/source-commit.txt
+
+      - name: Configura solo XN297Dump con UART e bootloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('Multiprotocol/_Config.h')
+          text = p.read_text()
+          text = re.sub(r'(?m)^(\s*#define\s+\w+_(?:A7105|CC2500|CYRF6936|NRF24L01|CCNRF|SX1276)_INO\b[^\n]*)', r'//\1', text)
+          text += '\n#define XN297DUMP_NRF24L01_INO\n'
+          for flag in ['CHECK_FOR_BOOTLOADER', 'ENABLE_SERIAL', 'A7105_INSTALLED', 'CC2500_INSTALLED', 'CYRF6936_INSTALLED', 'NRF24L01_INSTALLED']:
+              assert re.search(r'^\s*#define\s+' + flag + r'\b', text, re.M), flag
+          p.write_text(text)
+          Path('output/config.h').write_text(text)
+          # Check the actual Serial type during compilation, not in the ctags input.
+          sketch = Path('Multiprotocol/Multiprotocol.ino')
+          sketch.write_text(sketch.read_text() + '''
+          #include <HardwareSerial.h>
+          #if defined(SERIAL_USB) || !defined(ARDUINO_MULTI_DEBUG)
+          #error IRX4 requires hardware UART debug with USB serial disabled
+          #endif
+          static HardwareSerial& irx4_uart_type_check = Serial;
+          ''')
+          PY
+
+      - name: Compila a 0x08002000 con debug USART1
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli compile \
+            --fqbn 'multi4in1:STM32F1:multistm32f103cb:debug_option=none,usb_support=disabled' \
+            --build-property 'build.upload_flags=-DGENERIC_BOOTLOADER -DARDUINO_MULTI_DEBUG' \
+            --build-path "$GITHUB_WORKSPACE/build" \
+            "$GITHUB_WORKSPACE/Multiprotocol" 2>&1 | tee output/build.log
+
+      - name: Verifica vettori, firma e funzioni incluse
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, re, struct
+          raw = Path('build/Multiprotocol.ino.bin').read_bytes()
+          sp, reset = struct.unpack_from('<II', raw)
+          assert 0x20000000 < sp <= 0x20005000, hex(sp)
+          assert reset & 1, 'Reset handler non Thumb'
+          assert 0x08002000 <= (reset & ~1) < 0x08002000 + len(raw), hex(reset)
+          assert len(raw) <= 120808, 'Firmware troppo grande'
+          sig = re.search(rb'multi-x([0-9a-fA-F]{8})-([0-9]{8})$', raw)
+          assert sig, 'Firma MULTI ufficiale assente'
+          flags = int(sig[1], 16)
+          assert flags & 3 == 1, 'MCU non STM32'
+          assert flags & 0x80, 'Supporto bootloader assente'
+          assert flags & 0x100, 'CHECK_FOR_BOOTLOADER assente'
+          assert flags & 0x1000, 'Debug seriale assente'
+          preproc = Path('build/preproc/ctags_target_for_gcc_minus_e.cpp').read_text()
+          assert 'XN297Dump_init' in preproc
+          assert 'XN297Dump_callback' in preproc
+          assert 'JXC STEER: wait CH67' in preproc
+          assert 'JXC: steering 487; throttle 500' in preproc
+          assert 'irx4_uart_type_check = Serial' in preproc, 'Verifica del tipo UART assente'
+          assert re.search(r'Serial\s*\.\s*begin\s*\(\s*115200\s*,', preproc), 'Inizializzazione UART assente'
+          name = 'jxcsteer.bin'
+          Path('output', name).write_bytes(raw)
+          digest = hashlib.sha256(raw).hexdigest()
+          Path('output/SHA256SUMS.txt').write_text(digest + '  ' + name + '\n')
+          report = f'Source: MULTI v1.3.4.63 JXC SMALL STEERING TEST\nBytes: {len(raw)}\nStack: {sp:#010x}\nReset: {reset:#010x}\nSignature: {sig[0].decode()}\nUART: USART1, 115200 baud, 8N1\nFlash origin: 0x08002000\nHardware test: pending\n'
+          Path('output/validation.txt').write_text(report)
+          print(report)
+          PY
+
+      - name: Conserva ELF e mappa
+        shell: bash
+        run: |
+          cp build/Multiprotocol.ino.elf output/
+          cp build/Multiprotocol.ino.map output/
+
+      - name: Scarica firmware e rapporto
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-JXC-STEER-TEST
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Conserva log in caso di errore
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRX4-JXC-STEER-diagnostica
+          path: output/
+          if-no-files-found: ignore
